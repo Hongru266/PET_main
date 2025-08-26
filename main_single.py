@@ -197,8 +197,11 @@ def main(args):
 
     
 
-    # resume
+    # 初始化训练状态
     best_mae, best_rmse, best_epoch = 1e8, 1e8, 0
+    start_epoch = 0
+    
+    # 检查是否有命令行指定的resume路径
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -209,18 +212,52 @@ def main(args):
         if 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
+            start_epoch = checkpoint['epoch'] + 1
             if 'best_mae' in checkpoint:
                 best_mae = checkpoint['best_mae']
             if 'best_rmse' in checkpoint:
                 best_rmse = checkpoint['best_rmse']
             if 'best_epoch' in checkpoint:
                 best_epoch = checkpoint['best_epoch']
+        print(f"从命令行指定的checkpoint恢复训练，从第 {start_epoch} 个 epoch 继续")
 
+    # 检查自动checkpoint目录
+
+    # 检查自动checkpoint目录
     ckpt_dir_name = f"{args.output_dir}_{args.lr}_{args.batch_size}_"
     ckpt_dir_name += f"{args.bce_loss_coef}_{args.smoothl1_loss_coef}_0825_try1"
     args.ckpt_dir = os.path.join("checkpoints", args.dataset_file, ckpt_dir_name)
-    os.makedirs(args.ckpt_dir, exist_ok=True)
+    
+    # 如果没有命令行指定的resume路径，则尝试从自动保存目录恢复
+    if not args.resume and os.path.exists(args.ckpt_dir):
+        ckpt_path = os.path.join(args.ckpt_dir, "checkpoint.pth")
+        if os.path.isfile(ckpt_path):
+            try:
+                checkpoint = torch.load(ckpt_path, map_location='cpu')
+                model_without_ddp.load_state_dict(checkpoint['model'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                start_epoch = checkpoint.get('epoch', 0) + 1
+                if 'best_mae' in checkpoint:
+                    best_mae = checkpoint['best_mae']
+                if 'best_rmse' in checkpoint:
+                    best_rmse = checkpoint['best_rmse']
+                if 'best_epoch' in checkpoint:
+                    best_epoch = checkpoint['best_epoch']
+                print(f"自动恢复训练，从第 {start_epoch} 个 epoch 继续")
+                print(f"之前最佳 MAE: {best_mae}, 最佳 epoch: {best_epoch}")
+            except Exception as e:
+                print(f"加载checkpoint失败: {e}")
+                print("开始新的训练")
+                start_epoch = 0
+        else:
+            print("checkpoint文件不存在，开始新的训练")
+    
+    # 确保checkpoint目录存在
+    if not os.path.exists(args.ckpt_dir):
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        print(f"创建checkpoint目录: {args.ckpt_dir}")
+    # os.makedirs(args.ckpt_dir, exist_ok=True)
 
     # output directory and log 
     if utils.is_main_process():
@@ -239,7 +276,7 @@ def main(args):
     # training
     print("Start training")
     start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(start_epoch, args.epochs):  # 使用动态确定的start_epoch
         if args.distributed:
             sampler_train.set_epoch(epoch)
         
