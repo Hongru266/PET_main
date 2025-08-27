@@ -231,6 +231,61 @@ class PET(nn.Module):
         self.quadtree_sparse = BasePETCount(backbone, num_classes, quadtree_layer='sparse', args=args, transformer=transformer)
         self.quadtree_dense = BasePETCount(backbone, num_classes, quadtree_layer='dense', args=args, transformer=transformer)
 
+    # def compute_offset_map(self, prob_map, masks, dicts_coords, dicts_keys, threshold=0.5):
+    #     """
+    #     Inputs:
+    #         prob_map: [B, H, W], float tensor of foreground probability
+    #         masks: [B, H, W], int tensor or numpy array, each mask has a unique id
+    #         dicts: list of dicts, each dict is {mask_id: (gt_x, gt_y)}
+    #         threshold: float, threshold to filter foreground pixels
+
+    #     Returns:
+    #         offset_map: [B, 2, H, W], with (Δx, Δy) at valid pixels, 0 elsewhere
+    #         valid_mask: [B, 1, H, W], indicating supervised pixels
+    #     """
+    #     B, H, W = prob_map.shape
+    #     device = prob_map.device
+
+    #     offset_map = torch.zeros((B, 2, H, W), device=device)
+    #     valid_mask = torch.zeros((B, 1, H, W), dtype=torch.bool, device=device)
+    #     # print(f'compute_offset_map: dicts_coords length: {len(dicts_coords[0])}, dicts_keys length:{len(dicts_keys[0])}')  # 输出概率图和掩码的形状
+
+    #     for b in range(B):
+    #         # Foreground mask
+    #         fg_mask = prob_map[b] > threshold  # [H, W]
+
+    #         mask_map = masks[b] if torch.is_tensor(masks) else torch.from_numpy(masks[b]).to(device)
+    #         unique_labels = torch.unique(mask_map)
+    #         # print(f'Batch {b}: unique labels in mask_map: {unique_labels.tolist()}, dicts_keys:{dicts_keys[b].tolist()}')  # 输出唯一标签和字典键
+
+    #         # Only consider pixels that are both foreground and within a valid mask
+    #         y_coords, x_coords = torch.where(fg_mask)
+    #         for y, x in zip(y_coords, x_coords):
+    #             mid = int(mask_map[y, x].item())
+    #             mid_id = mid-1
+    #             if mid == 0 or mid_id not in dicts_keys[b]:
+    #                 continue
+
+    #             # 找到 mid 在 dicts_keys[b] 中的位置
+    #             indices = torch.where(dicts_keys[b] == mid_id)[0]
+    #             # print(f'indices for mid {mid_id} in dicts_keys[{b}]: {indices}')  # 输出索引信息
+    #             if len(indices) == 0:
+    #                 continue
+    #             idx = indices[0].item()  # 取第一个匹配的索引
+    #             # print(f'Batch {b}, y: {y.item()}, x: {x.item()}, mid: {mid}, idx: {idx}')  # 输出索引信息
+
+    #             try:
+    #                 gt_x, gt_y = dicts_coords[b][idx]
+    #             except IndexError as e:
+    #                 print(f"  Batch {b}: trying to access index {mid}, dicts_coords[{b}] length: {len(dicts_coords[b])}, dicts_keys[{b}] length: {len(dicts_keys[b])}, dicts_keys[{b}] content: {dicts_keys[b]}")
+    #                 raise e  # 重新抛出异常以便调试
+                    
+    #             offset_map[b, 0, y, x] = gt_x - x.item()
+    #             offset_map[b, 1, y, x] = gt_y - y.item()
+    #             valid_mask[b, 0, y, x] = True
+
+    #     return offset_map, valid_mask
+
     def compute_offset_map(self, prob_map, masks, dicts_coords, dicts_keys, threshold=0.5):
         """
         Inputs:
@@ -250,39 +305,61 @@ class PET(nn.Module):
         valid_mask = torch.zeros((B, 1, H, W), dtype=torch.bool, device=device)
         # print(f'compute_offset_map: dicts_coords length: {len(dicts_coords[0])}, dicts_keys length:{len(dicts_keys[0])}')  # 输出概率图和掩码的形状
 
+        # meshgrid of pixel coords
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+        )  # [H,W]
+
+
         for b in range(B):
             # Foreground mask
             fg_mask = prob_map[b] > threshold  # [H, W]
 
             mask_map = masks[b] if torch.is_tensor(masks) else torch.from_numpy(masks[b]).to(device)
-            unique_labels = torch.unique(mask_map)
-            # print(f'Batch {b}: unique labels in mask_map: {unique_labels.tolist()}, dicts_keys:{dicts_keys[b].tolist()}')  # 输出唯一标签和字典键
+            mask_map = mask_map.long()
+            # print(f'unique_labels:{mask_map.unique()}, dict_keys:{dicts_keys[b].tolist()}')
+            # break
 
-            # Only consider pixels that are both foreground and within a valid mask
-            y_coords, x_coords = torch.where(fg_mask)
-            for y, x in zip(y_coords, x_coords):
-                mid = int(mask_map[y, x].item())
-                mid_id = mid-1
-                if mid == 0 or mid_id not in dicts_keys[b]:
-                    continue
+            # --- build lookup table: mask_id -> (gt_x, gt_y) ---
+            # max_id = int(mask_map.max().item())
+            unique_labels = mask_map.unique()
+            lookup = torch.zeros((len(dicts_keys[b]), 2), device=device)
+            lookup[:] = float('nan')  # mark invalid ids
+            # print(f'unique labels in mask_map:{len(unique_labels)}, dicts_keys length:{len(dicts_keys[b])}, dicts_coords length:{len(dicts_coords[b])}')
+            for i, (gt_x, gt_y) in enumerate(dicts_coords[b]):
+                lookup[i] = torch.tensor([gt_x, gt_y], device=device)
 
-                # 找到 mid 在 dicts_keys[b] 中的位置
-                indices = torch.where(dicts_keys[b] == mid_id)[0]
-                # print(f'indices for mid {mid_id} in dicts_keys[{b}]: {indices}')  # 输出索引信息
-                if len(indices) == 0:
-                    continue
-                idx = indices[0].item()  # 取第一个匹配的索引
-                # print(f'Batch {b}, y: {y.item()}, x: {x.item()}, mid: {mid}, idx: {idx}')  # 输出索引信息
+            # --- use mask_map as index into lookup ---
+            # dicts_keys[b] 是 [id0, id1, ...]，建立一个映射表
+            id_to_index = {k.item(): i for i, k in enumerate(dicts_keys[b])}
+            
 
-                try:
-                    gt_x, gt_y = dicts_coords[b][idx]
-                except IndexError as e:
-                    print(f"  Batch {b}: trying to access index {mid}, dicts_coords[{b}] length: {len(dicts_coords[b])}, dicts_keys[{b}] length: {len(dicts_keys[b])}, dicts_keys[{b}] content: {dicts_keys[b]}")
-                    raise e  # 重新抛出异常以便调试
-                    
-                offset_map[b, 0, y, x] = gt_x - x.item()
-                offset_map[b, 1, y, x] = gt_y - y.item()
-                valid_mask[b, 0, y, x] = True
+            # 映射整张 mask_map (vectorized)
+            index_map = torch.full_like(mask_map, fill_value=0)  # 默认背景=0
+            valid_mask1 = torch.zeros_like(mask_map, dtype=torch.bool)
+            for k, idx in id_to_index.items():
+                # index_map[mask_map == (k+1)] = idx   # 如果你的 mid= id+1, 就写 (k+1)
+                mask = (mask_map == (k+1))
+                index_map[mask] = idx
+                valid_mask1 |= mask
+            # gt_coords = lookup[mask_map]   # [H,W,2]
+            gt_coords = torch.zeros((*mask_map.shape, 2), device=mask_map.device, dtype=torch.float)
+            gt_coords[valid_mask1] = lookup[index_map[valid_mask1]]
+            gt_x_map, gt_y_map = gt_coords[...,0], gt_coords[...,1]
+
+            # --- compute offset ---
+            dx = gt_x_map - xx
+            dy = gt_y_map - yy
+
+            # valid if foreground and lookup was filled
+            is_valid = fg_mask & ~torch.isnan(gt_x_map)
+
+            offset_map[b,0] = torch.where(is_valid, dx, torch.zeros_like(dx))
+            offset_map[b,1] = torch.where(is_valid, dy, torch.zeros_like(dy))
+            valid_mask[b,0] = is_valid
+            # valid_mask[b, 0].copy_(is_valid)
 
         return offset_map, valid_mask
 
@@ -362,9 +439,9 @@ class PET(nn.Module):
         prob_map = prob_map.squeeze(1)
         loss_bce = F.binary_cross_entropy_with_logits(prob_map, binary_target_masks.float(), reduction='none')
         # print(f'loss_bce shape: {loss_bce.shape}, loss_bce min: {loss_bce.min()}, max: {loss_bce.max()}, loss_bce mean:{loss_bce.mean()}')  # 输出二进制交叉熵损失的形状和范围
-        losses += loss_bce.mean() * 1.0  # BCE loss for segmentation
+        losses += loss_bce.mean() * 10.0  # BCE loss for segmentation
         loss_dict['loss_bce'] = loss_bce.mean()
-        weight_dict['loss_bce'] = 1.0
+        weight_dict['loss_bce'] = 10.0
 
         offset_map, valid_masks = self.compute_offset_map(prob_map, target_masks, target_dicts_coords, target_dicts_keys, threshold=0.5)
         gt_offset_map = torch.cat([target["offset_map"].unsqueeze(0) for target in targets], dim=0)  # [B, 2, H, W]

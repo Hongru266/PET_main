@@ -140,7 +140,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-        print(f'Time taken - Data: {t_data - t_start:.4f}s, Forward: {t_forward - t_data:.4f}s, Loss: {t_loss - t_forward:.4f}s, Backward: {t_backward - t_loss:.4f}s')
+        # print(f'Time taken - Data: {t_data - t_start:.4f}s, Forward: {t_forward - t_data:.4f}s, Loss: {t_loss - t_forward:.4f}s, Backward: {t_backward - t_loss:.4f}s')
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
