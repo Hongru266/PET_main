@@ -17,6 +17,8 @@ import torch.nn.functional as F
 import util.misc as utils
 from util.misc import NestedTensor
 
+import time
+
 
 class DeNormalize(object):
     def __init__(self, mean, std):
@@ -95,18 +97,23 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     # 这个循环不会打印训练进度
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+        t_start = time.time()
         samples = samples.to(device)
         # 将所有张量数据移动到设备上
         targets = [{k: v.to(device) if hasattr(v, 'to') else v 
                    for k, v in t.items()} for t in targets]
         gt_points = [target['points'] for target in targets]
         # print(f' samples shape: {samples.tensors.shape}, targets: {len(targets)}')
+        t_data = time.time()
 
         outputs = model(samples, epoch=epoch, train=True, 
                                         criterion=criterion, targets=targets)
             # print(f'train_one_epoch: output keys: {outputs.keys()}')
+        t_forward = time.time()
+
         loss_dict, weight_dict, losses= outputs['loss_dict'], outputs['weight_dict'], outputs['losses']
         # print(f'train_one_epoch: loss_dict keys:{loss_dict.keys()}, weight_dict keys:{weight_dict.keys()}')
+        t_loss = time.time()
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
@@ -128,10 +135,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
+        t_backward = time.time()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-    
+
+        print(f'Time taken - Data: {t_data - t_start:.4f}s, Forward: {t_forward - t_data:.4f}s, Loss: {t_loss - t_forward:.4f}s, Backward: {t_backward - t_loss:.4f}s')
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
