@@ -197,7 +197,7 @@ def main(args):
 
     
 
-    # resume
+    # 初始化训练状态
     best_mae, best_rmse, best_epoch = 1e8, 1e8, 0
     start_epoch = 0
     
@@ -223,6 +223,9 @@ def main(args):
 
     # 检查自动checkpoint目录
 
+    # 检查自动checkpoint目录
+
+    # 检查自动checkpoint目录
     ckpt_dir_name = f"{args.output_dir}_{args.lr}_{args.batch_size}_"
     ckpt_dir_name += f"{args.bce_loss_coef}_{args.smoothl1_loss_coef}_0827_try1"
     args.ckpt_dir = os.path.join("checkpoints", args.dataset_file, ckpt_dir_name)
