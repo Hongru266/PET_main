@@ -325,28 +325,103 @@ class PET(nn.Module):
             # --- build lookup table: mask_id -> (gt_x, gt_y) ---
             # max_id = int(mask_map.max().item())
             unique_labels = mask_map.unique()
-            lookup = torch.zeros((len(dicts_keys[b]), 2), device=device)
-            lookup[:] = float('nan')  # mark invalid ids
-            # print(f'unique labels in mask_map:{len(unique_labels)}, dicts_keys length:{len(dicts_keys[b])}, dicts_coords length:{len(dicts_coords[b])}')
-            for i, (gt_x, gt_y) in enumerate(dicts_coords[b]):
-                lookup[i] = torch.tensor([gt_x, gt_y], device=device)
+            # lookup = torch.zeros((len(unique_labels)+1, 2), device=device)
+            # lookup[:] = float('nan')  # mark invalid ids
+            # # print(f'unique labels in mask_map:{len(unique_labels)}, dicts_keys length:{len(dicts_keys[b])}, dicts_coords length:{len(dicts_coords[b])}')
+            # for i, (gt_x, gt_y) in enumerate(dicts_coords[b]):
+            #     lookup[i] = torch.tensor([gt_x, gt_y], device=device)
+            lookup = []
 
             # --- use mask_map as index into lookup ---
             # dicts_keys[b] 是 [id0, id1, ...]，建立一个映射表
-            id_to_index = {k.item(): i for i, k in enumerate(dicts_keys[b])}
+            # id_to_index = {k.item(): i for i, k in enumerate(dicts_keys[b])}
+            # id_to_index = {}
             
 
             # 映射整张 mask_map (vectorized)
             index_map = torch.full_like(mask_map, fill_value=0)  # 默认背景=0
             valid_mask1 = torch.zeros_like(mask_map, dtype=torch.bool)
-            for k, idx in id_to_index.items():
-                # index_map[mask_map == (k+1)] = idx   # 如果你的 mid= id+1, 就写 (k+1)
-                mask = (mask_map == (k+1))
-                index_map[mask] = idx
+
+            # --------------------
+            # 第一步：处理 dicts_keys 里有点的实例
+            # --------------------
+            id_to_index = {}
+            cur_idx = 1
+            for i, (inst_id, (gt_x, gt_y)) in enumerate(zip(dicts_keys[b], dicts_coords[b])):
+                inst_id = inst_id.item()
+                id_to_index[inst_id] = cur_idx
+                lookup.append(torch.tensor([gt_x, gt_y], device=mask_map.device))
+
+                # 写入 index_map
+                mask = (mask_map == (inst_id+1))  # 注意这里是否需要 +1，取决于 mask 编码
+                index_map[mask] = cur_idx
                 valid_mask1 |= mask
+
+                cur_idx += 1
+
+            # --------------------
+            # 第二步：处理 mask_map 中剩余但不在 dicts_keys 的实例
+            # --------------------
+            for inst_id in unique_labels:
+                if inst_id == 0:  # 跳过背景
+                    continue
+
+                if (inst_id - 1) in id_to_index:
+                    continue  # 已经处理过
+
+                mask = (mask_map == inst_id)
+                coords = torch.nonzero(mask, as_tuple=False)
+                center = coords.float().mean(dim=0)  # 质心 [y, x]
+
+                lookup.append(torch.tensor([center[1], center[0]], device=mask_map.device))
+
+                index_map[mask] = cur_idx
+                valid_mask1 |= mask
+                cur_idx += 1
+
+            # for inst_id in unique_labels:
+            #     if inst_id == 0:  # 跳过背景
+            #         continue
+
+            #     mask = (mask_map == inst_id)
+
+            #     if (inst_id - 1) in id_to_index:  
+            #         # 如果这个实例有真实点
+            #         idx = id_to_index[inst_id - 1]
+            #     else:
+            #         # 没有点 → 生成一个新的伪 index
+            #         idx = next_idx
+            #         next_idx += 1
+
+            #         # 在 mask 内部随机选一个像素当作伪点坐标（或用质心）
+            #         coords = torch.nonzero(mask, as_tuple=False)
+            #         center = coords.float().mean(dim=0)  # 质心 [y, x]
+            #         # 存入 lookup 表
+            #         lookup[idx] = torch.tensor([center[1], center[0]], device=mask_map.device)
+            #     index_map[mask] = idx
+            #     valid_mask1 |= mask
+
+            # lookup = torch.stack(lookup, dim=0)  # [N, 2]
+            if len(lookup) == 0:
+                # 没有前景实例时，用一个默认点占位
+                lookup = torch.zeros((1, 2), device=mask_map.device)
+            else:
+                lookup = torch.stack(lookup, dim=0)
+
+
+            # print("lookup.shape:", lookup.shape)  # [N, 2]
+            # print("index_map max:", index_map.max().item())
+            # print("index_map min:", index_map.min().item())
+            # print("valid_mask1 sum:", valid_mask1.sum().item())
+            # # 检查是否有越界
+            # invalid_idx = (index_map[valid_mask1] >= lookup.shape[0]) | (index_map[valid_mask1] < 0)
+            # if invalid_idx.any():
+            #     print("Invalid indices found:", index_map[valid_mask1][invalid_idx])
+            #     raise ValueError("index_map contains out-of-range indices!")
+            
             # gt_coords = lookup[mask_map]   # [H,W,2]
             gt_coords = torch.zeros((*mask_map.shape, 2), device=mask_map.device, dtype=torch.float)
-            gt_coords[valid_mask1] = lookup[index_map[valid_mask1]]
+            gt_coords[valid_mask1] = lookup[index_map[valid_mask1]-1]
             gt_x_map, gt_y_map = gt_coords[...,0], gt_coords[...,1]
 
             # --- compute offset ---

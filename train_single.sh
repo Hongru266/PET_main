@@ -1,5 +1,5 @@
 #!/bin/bash
-CUDA_VISIBLE_DEVICES='5' \
+CUDA_VISIBLE_DEVICES='7' \
 python main_single.py \
     --lr=0.00001 \
     --backbone="vgg16_bn" \
