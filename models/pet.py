@@ -514,9 +514,9 @@ class PET(nn.Module):
         prob_map = prob_map.squeeze(1)
         loss_bce = F.binary_cross_entropy_with_logits(prob_map, binary_target_masks.float(), reduction='none')
         # print(f'loss_bce shape: {loss_bce.shape}, loss_bce min: {loss_bce.min()}, max: {loss_bce.max()}, loss_bce mean:{loss_bce.mean()}')  # 输出二进制交叉熵损失的形状和范围
-        losses += loss_bce.mean() * 1.0  # BCE loss for segmentation
+        losses += loss_bce.mean() * 10.0  # BCE loss for segmentation
         loss_dict['loss_bce'] = loss_bce.mean()
-        weight_dict['loss_bce'] = 1.0
+        weight_dict['loss_bce'] = 10.0
 
         offset_map, valid_masks = self.compute_offset_map(prob_map, target_masks, target_dicts_coords, target_dicts_keys, threshold=0.5)
         gt_offset_map = torch.cat([target["offset_map"].unsqueeze(0) for target in targets], dim=0)  # [B, 2, H, W]
