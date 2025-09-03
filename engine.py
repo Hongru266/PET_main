@@ -18,6 +18,7 @@ import util.misc as utils
 from util.misc import NestedTensor
 
 import time
+from sklearn.cluster import DBSCAN
 
 
 class DeNormalize(object):
@@ -149,10 +150,171 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+def get_pred_points(prob_map, offset_map, prob_thresh=0.5, eps=3, min_samples=2, min_cluster_size=2):
+    """
+    从 prob_map + offset_map 得到预测的人头中心点
+    
+    Args:
+        prob_map: Tensor [H, W]   # 像素概率
+        offset_map: Tensor [2, H, W]   # 偏移向量 (dx, dy)
+        prob_thresh: 阈值
+        eps: DBSCAN 半径
+        min_samples: DBSCAN 最小点数
+    Returns:
+        pred_points: list of (x, y) 预测中心点
+    """
+    H, W = prob_map.shape
+    # 1. 前景像素
+    # thresh = torch.quantile(prob_map, 0.8)  # 取前5%高置信度
+    mask = prob_map > prob_thresh
+    ys, xs = torch.where(mask)
+
+    if len(xs) == 0:
+        return []
+    
+    # 2. 应用 offset 得到中心点位置
+    dx = offset_map[0, ys, xs]
+    dy = offset_map[1, ys, xs]
+    cx = xs + dx
+    cy = ys + dy
+
+    coords = torch.stack([cx, cy], dim=1).cpu().numpy()
+
+    coords = coords[~np.isnan(coords).any(axis=1)]
+    coords = coords[~np.isinf(coords).any(axis=1)]
+    # print(f'coords shape:{coords.shape}')
+    if coords.shape[0] == 0:  
+        return []
+
+    # 3. 聚类 (DBSCAN 合并重复投票)
+    if len(coords) == 0:
+        return []
+
+    # Step 1. DBSCAN 聚类
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
+    labels = clustering.labels_
+
+    pred_points = []
+
+    # Step 2. 遍历簇
+    for lab in set(labels):
+        if lab == -1:  # 噪声点忽略
+            continue
+
+        cluster_pts = coords[labels == lab]       # 当前簇的坐标
+        # cluster_probs = prob_map[labels == lab]   # 当前簇的置信度
+        cluster_mask = (labels == lab)
+        cluster_ys = ys[cluster_mask]
+        cluster_xs = xs[cluster_mask]
+        cluster_probs = prob_map[cluster_ys, cluster_xs]
+
+        # Step 3. 过滤掉太小的簇
+        if len(cluster_pts) < min_cluster_size:
+            continue
+
+        # Step 4. 置信度加权聚类中心 (避免简单平均带来偏移)
+        weights = cluster_probs / (cluster_probs.sum() + 1e-6)  # 归一化
+        cx = np.sum(cluster_pts[:, 0] * weights.cpu().numpy())
+        cy = np.sum(cluster_pts[:, 1] * weights.cpu().numpy())
+
+        pred_points.append((cx, cy))
+
+    return pred_points
+
+def get_pred_points_mixed(prob_map, offset_map=None, prob_thresh=0.5, sigma=1.0,
+                          eps=3, min_samples=2, min_cluster_size=2, mode="union"):
+    """
+    混合策略：结合 prob_map 局部极大值检测 和 offset_map 投票方式
+    
+    Args:
+        prob_map: Tensor [H, W]   # 像素概率
+        offset_map: Tensor [2, H, W] or None   # 偏移向量 (dx, dy)，可以为 None
+        prob_thresh: float 阈值
+        sigma: 高斯平滑参数
+        eps, min_samples: DBSCAN 参数
+        min_cluster_size: 过滤太小的簇
+        mode: 'union' 或 'intersect' 或 'prob_only'
+              - union: 两种方法取并集
+              - intersect: 两种方法取交集
+              - prob_only: 只用 prob_map 峰值（不依赖 offset）
+    Returns:
+        pred_points: list of (x, y)
+    """
+
+    H, W = prob_map.shape
+    prob_map_cpu = prob_map.detach().cpu().numpy()
+
+    # === 1. 高斯平滑 + 阈值 ===
+    prob_smooth = ndimage.gaussian_filter(prob_map_cpu, sigma=sigma)
+    mask = prob_smooth > prob_thresh
+
+    # === 2. 局部极大值检测 ===
+    local_max = (prob_smooth == ndimage.maximum_filter(prob_smooth, size=3))
+    peaks = local_max & mask
+    ys_peak, xs_peak = np.where(peaks)
+
+    peak_points = [(xs_peak[i], ys_peak[i]) for i in range(len(xs_peak))]
+
+    # 如果只用 prob_map，直接返回
+    if mode == "prob_only" or offset_map is None:
+        return peak_points
+
+    # === 3. offset_map 修正 ===
+    mask_tensor = prob_map > prob_thresh
+    ys, xs = torch.where(mask_tensor)
+
+    if len(xs) > 0:
+        dx = offset_map[0, ys, xs]
+        dy = offset_map[1, ys, xs]
+        cx = xs + dx
+        cy = ys + dy
+        coords = torch.stack([cx, cy], dim=1).cpu().numpy()
+
+        # DBSCAN 聚类
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
+        labels = clustering.labels_
+
+        offset_points = []
+        for lab in set(labels):
+            if lab == -1:  # 噪声点
+                continue
+            cluster_pts = coords[labels == lab]
+            cluster_mask = (labels == lab)
+            cluster_ys = ys[cluster_mask]
+            cluster_xs = xs[cluster_mask]
+            cluster_probs = prob_map[cluster_ys, cluster_xs]
+
+            if len(cluster_pts) < min_cluster_size:
+                continue
+
+            weights = cluster_probs / (cluster_probs.sum() + 1e-6)
+            cx = np.sum(cluster_pts[:, 0] * weights.cpu().numpy())
+            cy = np.sum(cluster_pts[:, 1] * weights.cpu().numpy())
+            offset_points.append((cx, cy))
+    else:
+        offset_points = []
+
+    # === 4. 融合策略 ===
+    if mode == "union":
+        pred_points = peak_points + offset_points
+    elif mode == "intersect":
+        pred_points = []
+        for px, py in peak_points:
+            for ox, oy in offset_points:
+                if np.hypot(px - ox, py - oy) < eps:
+                    pred_points.append(((px + ox) / 2, (py + oy) / 2))
+    else:
+        pred_points = peak_points
+
+    return pred_points
+
+
 # evaluation
 @torch.no_grad()
 def evaluate(model, data_loader, device, epoch=0, vis_dir=None):
     model.eval()
+    prob_map = None
+    prob_thresh = 0.5
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -171,10 +333,14 @@ def evaluate(model, data_loader, device, epoch=0, vis_dir=None):
         outputs_scores = torch.nn.functional.softmax(outputs['pred_logits'], -1)[:, :, 1][0]
         outputs_points = outputs['pred_points'][0]
         outputs_offsets = outputs['pred_offsets'][0]
-        
+
+        outputs_offset_map = outputs['offset_map'][0]
         prob_map = outputs['prob_map'][0,0]
+        np.save("test_predict_prob_map", prob_map.detach().cpu().numpy())
+        np.save("test_offset_map", outputs_offset_map.detach().cpu().numpy())
         threshold = 0.5
 
+        
         # 1. 高斯平滑（可选）
         prob_map_cpu = prob_map.detach().cpu().numpy()  # 转换为CPU上的numpy数组
         prob_smooth = ndimage.gaussian_filter(prob_map_cpu, sigma=1.0)
@@ -185,22 +351,31 @@ def evaluate(model, data_loader, device, epoch=0, vis_dir=None):
         peaks = local_max & mask
 
         # 将张量转换为numpy数组并进行阈值操作
-        # prob_map_numpy = prob_map.detach().cpu().numpy()
-        # binary_map = (prob_map_numpy > threshold).astype(np.uint8)
-        # structure = np.ones((3, 3), dtype=np.int32)  # 8-connected，使用 np.int32 替代 np.int
-        # labeled_map, num_clusters = label(binary_map, structure=structure)
-        # # num_clusters, labeled_map = cv2.connectedComponents(binary_map)
-        # num_clusters -= 1  # OpenCV 默认包含背景 label 0，需要减去
+        prob_map_numpy = prob_map.detach().cpu().numpy()
+        binary_map = (prob_map_numpy > threshold).astype(np.uint8)
+        structure = np.ones((3, 3), dtype=np.int32)  # 8-connected，使用 np.int32 替代 np.int
+        labeled_map, num_clusters = label(binary_map, structure=structure)
+        # num_clusters, labeled_map = cv2.connectedComponents(binary_map)
+        num_clusters -= 1  # OpenCV 默认包含背景 label 0，需要减去
 
         # process predicted points
-        # predict_cnt = len(outputs_scores)
-        predict_cnt = peaks.sum().item()
+        predict_cnt1 = len(outputs_scores)
+        predict_cnt1 = peaks.sum().item()
+
+        pred_points = get_pred_points(prob_map, outputs_offset_map, prob_thresh=prob_thresh)
+        np.save("pred_points.npy", pred_points)
+        predict_cnt = len(pred_points)
+
+        pred_points2 = get_pred_points_mixed(prob_map, outputs_offset_map, prob_thresh=prob_thresh, mode="union")
+        predict_cnt2 = len(pred_points2)
+        
         # predict_cnt = num_clusters
         gt_cnt = targets[0]['points'].shape[0]
+        print(f'evsl1:{predict_cnt1}, evsl2:{predict_cnt}, eval3:{predict_cnt2} gt_points:{gt_cnt}')
 
         # compute error
-        mae = abs(predict_cnt - gt_cnt)
-        mse = (predict_cnt - gt_cnt) * (predict_cnt - gt_cnt)
+        mae = abs(predict_cnt2 - gt_cnt)
+        mse = (predict_cnt2 - gt_cnt) * (predict_cnt2 - gt_cnt)
 
         # record results
         results = {}

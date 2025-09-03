@@ -4,6 +4,7 @@ PET model and criterion classes
 import torch
 import torch.nn.functional as F
 from torch import nn
+import numpy as np
 
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        get_world_size, is_dist_avail_and_initialized)
@@ -12,6 +13,7 @@ from .matcher import build_matcher
 from .backbones import *
 from .transformer import *
 from .position_encoding import build_position_encoding
+from scipy.ndimage import distance_transform_edt
 
 
 class BasePETCount(nn.Module):
@@ -29,6 +31,10 @@ class BasePETCount(nn.Module):
 
         self.pq_stride = args.sparse_stride if quadtree_layer == 'sparse' else args.dense_stride
         self.feat_name = '8x' if quadtree_layer == 'sparse' else '4x'
+
+        self.prob_head = torch.nn.Conv2d(hidden_dim, 1, kernel_size=1)   # 前景概率
+        self.offset_head = torch.nn.Conv2d(hidden_dim, 2, kernel_size=1) # 偏移向量
+
     
     def points_queris_embed(self, samples, stride=8, src=None, **kwargs):
         """
@@ -37,18 +43,26 @@ class BasePETCount(nn.Module):
         # dense position encoding at every pixel location
         dense_input_embed = kwargs['dense_input_embed']
         bs, c = dense_input_embed.shape[:2]
-        device = dense_input_embed.device  # get device from input tensor
+        # device = dense_input_embed.device  # get device from input tensor
 
         # get image shape
         input = samples.tensors
-        image_shape = torch.tensor(input.shape[2:], device=device)
+        # print(f'samples.tensors.shape: {samples.tensors.shape}')
+        image_shape = torch.tensor(input.shape[2:], device=input.device)
         shape = (image_shape + stride//2 -1) // stride
 
         # generate point queries
-        shift_x = ((torch.arange(0, shape[1], device=device) + 0.5) * stride).long()
-        shift_y = ((torch.arange(0, shape[0], device=device) + 0.5) * stride).long()
+        shift_x = ((torch.arange(0, shape[1]) + 0.5) * stride).long()
+        shift_y = ((torch.arange(0, shape[0]) + 0.5) * stride).long()
+        # print("image_shape:", image_shape)           # e.g. (256, 256)
+        # print("max shift_x:", shift_x.max().item())  # 看看是不是 > image_shape[1]-1
+        # print("max shift_y:", shift_y.max().item())
+        # shift_x = shift_x.clamp(0, image_shape[1]-1)
+        # shift_y = shift_y.clamp(0, image_shape[0]-1)
         shift_y, shift_x = torch.meshgrid(shift_y, shift_x)  # 移除 indexing 参数
         points_queries = torch.vstack([shift_y.flatten(), shift_x.flatten()]).permute(1,0) # 2xN --> Nx2
+        # print("points_queries min:", points_queries.min().item(), "max:", points_queries.max().item())
+        # print("input shape:", input.shape)
         h, w = shift_x.shape
 
         # get point queries embedding
@@ -107,14 +121,15 @@ class BasePETCount(nn.Module):
         div_win = window_partition(div.unsqueeze(1), window_size_h=dec_win_h, window_size_w=dec_win_w)
         valid_div = (div_win > 0.5).sum(dim=0)[:,0] 
         v_idx = valid_div > 0 #有效区域索引
+        print(f'length of v_idx:{len(v_idx)}, v_idx shape:{v_idx.shape}')
         
         # ensure device consistency
-        device = query_embed_win.device
-        if v_idx.device != device:
-            v_idx = v_idx.to(device)
-        if points_queries_win.device != device:
-            points_queries_win = points_queries_win.to(device)
-            
+        # device = query_embed_win.device
+        # if v_idx.device != device:
+        #     v_idx = v_idx.to(device)
+        # if points_queries_win.device != device:
+        #     points_queries_win = points_queries_win.to(device)
+        print(f'query_embed_win shape:{query_embed_win.shape}, points_queries_win shape:{points_queries_win.shape}, query_feats_win shape:{query_feats_win.shape}')
         query_embed_win = query_embed_win[:, v_idx]
         query_feats_win = query_feats_win[:, v_idx]
         points_queries_win = points_queries_win[:, v_idx].reshape(-1, 2)
@@ -138,31 +153,100 @@ class BasePETCount(nn.Module):
         out = (query_embed, points_queries, query_feats, v_idx)
         return out
     
+    def generate_prob_offset_map(self, points_queries, img_h, img_w, sigma, device="cuda"):
+        """
+        根据点坐标生成 prob_map 和 offset_map
+        points_queries: (N, 2), 已归一化 [0,1]，格式 (y, x)
+        """
+        # print(batch_size)
+        # print(f'points_queries shape:{points_queries.shape}')
+        # batch_size = int(batch_size)
+        for i in range(min(10, points_queries.shape[0])):
+            print(f'idx {i}: y={points_queries[i,0].item()}, x={points_queries[i,1].item()}')
+        prob_map = torch.zeros((1, img_h, img_w), device=device)   # 单通道
+        offset_map = torch.zeros((2, img_h, img_w), device=device) # 两通道 (dy, dx)
+
+        yy, xx = torch.meshgrid(
+            torch.arange(img_h, device=device),
+            torch.arange(img_w, device=device),
+            indexing="ij"
+        )  # [H, W]
+        if points_queries.numel() > 0:
+            # 还原到像素坐标
+            # print(f'points_queries device:{points_queries.device}, img_h:{img_h}, img_w:{img_w}')
+            pts_y = (points_queries[:, 0] * img_h).long()
+            pts_y = torch.clamp(pts_y, 0, img_h - 1)
+            pts_x = (points_queries[:, 1] * img_w).long()
+            pts_x = torch.clamp(pts_x, 0, img_w - 1)
+            print(pts_y.min(), pts_y.max())
+            
+            pts_y_list = pts_y.tolist()  # 或 pts_y.tolist()
+            pts_x_list = pts_x.cpu().numpy().tolist()
+            # valid_mask = (pts_y >= 0) & (pts_y < float(img_h)) & (pts_x >= 0) & (pts_x < float(img_w))
+            # valid_pts_y = pts_y[valid_mask]
+            # valid_pts_x = pts_x[valid_mask]
+            # print(f'pts_y: {len(pts_y)}, pts_y type:{type(pts_y)}, pts_x: {len(pts_x)}')
+
+            for y, x in zip(pts_y_list, pts_x_list):
+                print(f'y:{y}, y type:{type(y)}')
+                y = y.item()
+                x = x.item()
+                if y < 0 or y >= img_h or x < 0 or x >= img_w:
+                    continue
+                # 在 prob_map 上加高斯核
+                g = torch.exp(-((yy - y)**2 + (xx - x)**2) / (2 * sigma**2))
+                prob_map = torch.maximum(prob_map, g.unsqueeze(0))  # 取最大，避免叠加过大
+
+            # offset_map：对每个像素找到最近点
+            pts = torch.stack([pts_y, pts_x], dim=1).float()  # [N, 2]
+            coords = torch.stack([yy, xx], dim=0).float()     # [2, H, W]
+
+            # 展平计算距离
+            coords_flat = coords.view(2, -1).t()  # [H*W, 2]
+            dists = torch.cdist(coords_flat.unsqueeze(0), pts.unsqueeze(0))  # [1, H*W, N]
+            nn_idx = torch.argmin(dists, dim=-1).squeeze(0)  # [H*W]
+            nearest_pts = pts[nn_idx]  # [H*W, 2]
+
+            offsets = (nearest_pts - coords_flat).t().view(2, img_h, img_w)
+            offset_map = offsets
+
+        return prob_map, offset_map
+
     def predict(self, samples, points_queries, hs, **kwargs):
         """
         Crowd prediction
         """
-        outputs_class = self.class_embed(hs)
+        outputs_class = self.class_embed(hs) #对hs进行分类预测
         # normalize to 0~1
-        outputs_offsets = (self.coord_embed(hs).sigmoid() - 0.5) * 2.0
+        outputs_offsets = (self.coord_embed(hs).sigmoid() - 0.5) * 2.0 #对hs预测点的坐标偏移量
 
         # normalize point-query coordinates
+        # print(f'samples.tensors.shape: {samples.tensors.shape}')
         img_shape = samples.tensors.shape[-2:]
         img_h, img_w = img_shape
+        # batch_size, N = points_queries.shape[0], points_queries.shape[1]
         points_queries = points_queries.float().cuda()
         points_queries[:, 0] /= img_h
-        points_queries[:, 1] /= img_w
+        points_queries[:, 1] /= img_w #对输入点query坐标进行归一化
 
-        # rescale offset range during testing
+        # rescale offset range during testing 测试阶段对偏移进行缩放
         if 'test' in kwargs:
             outputs_offsets[...,0] /= (img_h / 256)
             outputs_offsets[...,1] /= (img_w / 256)
 
+        # 取最后一层 decoder 输出
         outputs_points = outputs_offsets[-1] + points_queries
-        out = {'pred_logits': outputs_class[-1], 'pred_points': outputs_points, 'img_shape': img_shape, 'pred_offsets': outputs_offsets[-1]}
-    
-        out['points_queries'] = points_queries
-        out['pq_stride'] = self.pq_stride
+
+        out = {
+            'pred_logits': outputs_class[-1],
+            'pred_points': outputs_points,
+            'img_shape': img_shape,
+            'pred_offsets': outputs_offsets[-1],
+            'points_queries': points_queries,
+            'pq_stride': self.pq_stride
+        }
+
+
         return out
 
     def forward(self, samples, features, context_info, **kwargs):
@@ -218,12 +302,32 @@ class PET(nn.Module):
             nn.Sigmoid(),
         ) #四象树分割器
 
-        self.foreground_head = nn.Sequential(
-            nn.Conv2d(256, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 1, kernel_size=1)  # 输出 [B, 1, H, W]
-        )
+        # self.foreground_head = nn.Sequential(
+        #     nn.Conv2d(256, 64, kernel_size=3, padding=1),
+        #     nn.ReLU(),
+        #     nn.Conv2d(64, 1, kernel_size=1)  # 输出 [B, 1, H, W]
+        # )
 
+        # # offset 分支：输入 encode_src，输出 [B, 2, H, W]
+        # self.offset_head = nn.Sequential(
+        #     nn.Conv2d(256, 128, kernel_size=3, padding=1),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(128, 64, kernel_size=3, padding=1),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(64, 2, kernel_size=1)   # 2 通道，分别是 dx, dy
+        # )
+
+        self.joint_head = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 3, kernel_size=1)   # [B,3,H,W]
+        )
+        args.sparse_stride, args.dense_stride = 8, 4    # point-query stride 稀疏层和密集层步长设置差异
+        transformer = build_decoder(args)
+        self.pet_head = BasePETCount(backbone, num_classes, quadtree_layer='sparse', args=args, transformer=transformer)
+        # self.offset_map_head = BasePETCount(backbone, num_classes=2, quadtree_layer='sparse', args=args, transformer=transformer)
 
         # point-query quadtree
         args.sparse_stride, args.dense_stride = 8, 4    # point-query stride 稀疏层和密集层步长设置差异
@@ -231,60 +335,6 @@ class PET(nn.Module):
         self.quadtree_sparse = BasePETCount(backbone, num_classes, quadtree_layer='sparse', args=args, transformer=transformer)
         self.quadtree_dense = BasePETCount(backbone, num_classes, quadtree_layer='dense', args=args, transformer=transformer)
 
-    # def compute_offset_map(self, prob_map, masks, dicts_coords, dicts_keys, threshold=0.5):
-    #     """
-    #     Inputs:
-    #         prob_map: [B, H, W], float tensor of foreground probability
-    #         masks: [B, H, W], int tensor or numpy array, each mask has a unique id
-    #         dicts: list of dicts, each dict is {mask_id: (gt_x, gt_y)}
-    #         threshold: float, threshold to filter foreground pixels
-
-    #     Returns:
-    #         offset_map: [B, 2, H, W], with (Δx, Δy) at valid pixels, 0 elsewhere
-    #         valid_mask: [B, 1, H, W], indicating supervised pixels
-    #     """
-    #     B, H, W = prob_map.shape
-    #     device = prob_map.device
-
-    #     offset_map = torch.zeros((B, 2, H, W), device=device)
-    #     valid_mask = torch.zeros((B, 1, H, W), dtype=torch.bool, device=device)
-    #     # print(f'compute_offset_map: dicts_coords length: {len(dicts_coords[0])}, dicts_keys length:{len(dicts_keys[0])}')  # 输出概率图和掩码的形状
-
-    #     for b in range(B):
-    #         # Foreground mask
-    #         fg_mask = prob_map[b] > threshold  # [H, W]
-
-    #         mask_map = masks[b] if torch.is_tensor(masks) else torch.from_numpy(masks[b]).to(device)
-    #         unique_labels = torch.unique(mask_map)
-    #         # print(f'Batch {b}: unique labels in mask_map: {unique_labels.tolist()}, dicts_keys:{dicts_keys[b].tolist()}')  # 输出唯一标签和字典键
-
-    #         # Only consider pixels that are both foreground and within a valid mask
-    #         y_coords, x_coords = torch.where(fg_mask)
-    #         for y, x in zip(y_coords, x_coords):
-    #             mid = int(mask_map[y, x].item())
-    #             mid_id = mid-1
-    #             if mid == 0 or mid_id not in dicts_keys[b]:
-    #                 continue
-
-    #             # 找到 mid 在 dicts_keys[b] 中的位置
-    #             indices = torch.where(dicts_keys[b] == mid_id)[0]
-    #             # print(f'indices for mid {mid_id} in dicts_keys[{b}]: {indices}')  # 输出索引信息
-    #             if len(indices) == 0:
-    #                 continue
-    #             idx = indices[0].item()  # 取第一个匹配的索引
-    #             # print(f'Batch {b}, y: {y.item()}, x: {x.item()}, mid: {mid}, idx: {idx}')  # 输出索引信息
-
-    #             try:
-    #                 gt_x, gt_y = dicts_coords[b][idx]
-    #             except IndexError as e:
-    #                 print(f"  Batch {b}: trying to access index {mid}, dicts_coords[{b}] length: {len(dicts_coords[b])}, dicts_keys[{b}] length: {len(dicts_keys[b])}, dicts_keys[{b}] content: {dicts_keys[b]}")
-    #                 raise e  # 重新抛出异常以便调试
-                    
-    #             offset_map[b, 0, y, x] = gt_x - x.item()
-    #             offset_map[b, 1, y, x] = gt_y - y.item()
-    #             valid_mask[b, 0, y, x] = True
-
-    #     return offset_map, valid_mask
 
     def compute_offset_map(self, prob_map, masks, dicts_coords, dicts_keys, threshold=0.5):
         """
@@ -425,8 +475,8 @@ class PET(nn.Module):
             gt_x_map, gt_y_map = gt_coords[...,0], gt_coords[...,1]
 
             # --- compute offset ---
-            dx = gt_x_map - xx
-            dy = gt_y_map - yy
+            dx = xx - gt_x_map
+            dy = yy - gt_y_map
 
             # valid if foreground and lookup was filled
             is_valid = fg_mask & ~torch.isnan(gt_x_map)
@@ -446,100 +496,61 @@ class PET(nn.Module):
         """
         output_sparse, output_dense = outputs['sparse'], outputs['dense']
         prob_map = outputs['prob_map']
-        target_dicts_coords = [target["dicts_coords"] for target in targets] # list of dicts, each dict is {mask_id: (gt_x, gt_y)}
-        target_dicts_keys = [target["dicts_keys"] for target in targets]  # list of dicts, each dict is {mask_id: (gt_x, gt_y)}
-        # print(f'compute_loss: output_sparse keys: {output_sparse.keys()}, output_dense keys: {output_dense.keys()}, prob_map shape:{prob_map.shape}')  # 输出稀疏和密集层的键
-        # print(f'targets keys: {[target.keys() for target in targets]}')  # 输出目标的键
+        # target_dicts_coords = [target["dicts_coords"] for target in targets] # list of dicts, each dict is {mask_id: (gt_x, gt_y)}
+        # target_dicts_keys = [target["dicts_keys"] for target in targets]  # list of dicts, each dict is {mask_id: (gt_x, gt_y)}
+
         weight_dict = criterion.weight_dict
         warmup_ep = 5
-
-        # compute loss
-        # if epoch >= warmup_ep:
-        #     loss_dict_sparse = criterion(output_sparse, targets, div=outputs['split_map_sparse'])
-        #     loss_dict_dense = criterion(output_dense, targets, div=outputs['split_map_dense'])
-        # else:
-        #     loss_dict_sparse = criterion(output_sparse, targets)
-        #     loss_dict_dense = criterion(output_dense, targets)
-        # print(f'compute_loss: loss_dict_sparse keys: {loss_dict_sparse.keys()}, loss_dict_dense keys: {loss_dict_dense.keys()}')  # 输出损失字典的键
-        # sparse point queries loss
-        # loss_dict_sparse = {k+'_sp':v for k, v in loss_dict_sparse.items()}
-        # weight_dict_sparse = {k+'_sp':v for k,v in weight_dict.items()}
-        # loss_pq_sparse = sum(loss_dict_sparse[k] * weight_dict_sparse[k] for k in loss_dict_sparse.keys() if k in weight_dict_sparse)
-
-        # dense point queries loss
-        # loss_dict_dense = {k+'_ds':v for k, v in loss_dict_dense.items()}
-        # weight_dict_dense = {k+'_ds':v for k,v in weight_dict.items()}
-        # loss_pq_dense = sum(loss_dict_dense[k] * weight_dict_dense[k] for k in loss_dict_dense.keys() if k in weight_dict_dense)
-    
-        # point queries loss
-        # losses = loss_pq_sparse + loss_pq_dense 
         losses=0
 
         # update loss dict and weight dict
         loss_dict = dict()
-        # loss_dict.update(loss_dict_sparse)
-        # loss_dict.update(loss_dict_dense)
-
         weight_dict = dict()
-        # weight_dict.update(weight_dict_sparse)
-        # weight_dict.update(weight_dict_dense)
-
-        # # quadtree splitter loss
-        # den = torch.tensor([target['density'] for target in targets])   # crowd density
-        # bs = len(den)
-        # ds_idx = den < 2 * self.quadtree_sparse.pq_stride   # dense regions index
-        # ds_div = outputs['split_map_raw'][ds_idx]
-        # sp_div = 1 - outputs['split_map_raw']
-
-        # # constrain sparse regions
-        # loss_split_sp = 1 - sp_div.view(bs, -1).max(dim=1)[0].mean()
-
-        # # constrain dense regions
-        # if sum(ds_idx) > 0:
-        #     ds_num = ds_div.shape[0]
-        #     loss_split_ds = 1 - ds_div.view(ds_num, -1).max(dim=1)[0].mean()
-        # else:
-        #     loss_split_ds = outputs['split_map_raw'].sum() * 0.0
-
-        # # update quadtree splitter loss            
-        # loss_split = loss_split_sp + loss_split_ds
-        # weight_split = 0.1 if epoch >= warmup_ep else 0.0
-        # # loss_dict['loss_split'] = loss_split
-        # # weight_dict['loss_split'] = weight_split
 
         target_masks = torch.cat([target["masks"].unsqueeze(0) for target in targets], dim=0).float()
         # 将非0值均变为1
         binary_target_masks = (target_masks > 0).float()
         # unique_labels = torch.unique(target_masks)  
         prob_map = prob_map.squeeze(1)
-        loss_bce = F.binary_cross_entropy_with_logits(prob_map, binary_target_masks.float(), reduction='none')
+        np.save("predict_prob_map", prob_map.detach().cpu().numpy())
+        loss_bce = F.binary_cross_entropy_with_logits(prob_map, binary_target_masks, reduction='none')
         # print(f'loss_bce shape: {loss_bce.shape}, loss_bce min: {loss_bce.min()}, max: {loss_bce.max()}, loss_bce mean:{loss_bce.mean()}')  # 输出二进制交叉熵损失的形状和范围
-        losses += loss_bce.mean() * 10.0  # BCE loss for segmentation
+        losses += loss_bce.mean() * 1.0  # BCE loss for segmentation
         loss_dict['loss_bce'] = loss_bce.mean()
-        weight_dict['loss_bce'] = 10.0
+        weight_dict['loss_bce'] = 1.0
 
-        offset_map, valid_masks = self.compute_offset_map(prob_map, target_masks, target_dicts_coords, target_dicts_keys, threshold=0.5)
+        target_dicts_coords = [target["dicts_coords"] for target in targets] # list of dicts, each dict is {mask_id: (gt_x, gt_y)}
+        target_dicts_keys = [target["dicts_keys"] for target in targets]  # list of dicts, each dict is {mask_id: (gt_x, gt_y)}
+        target_masks = torch.cat([target["masks"].unsqueeze(0) for target in targets], dim=0).float()
+        # offset_map, valid_masks = self.compute_offset_map(prob_map, target_masks, target_dicts_coords, target_dicts_keys, threshold=0.5)
+        
+        # 在训练阶段需要 GT offset_map 来计算 loss
+        # if self.training:
+        #     gt_offset_map, valid_masks = self.compute_offset_map(prob_map, target_masks, 
+        #                                                         target_dicts_coords, target_dicts_keys, threshold=0.5)
+        # else:
+        #     gt_offset_map, valid_masks = None, None
+   
+        offset_map = outputs['offset_map']
         gt_offset_map = torch.cat([target["offset_map"].unsqueeze(0) for target in targets], dim=0)  # [B, 2, H, W]
-        # print(f'offset_map shape: {offset_map.shape}, valid_masks shape: {valid_masks.shape}, gt_offset_map shape: {gt_offset_map.shape}')  # 输出偏移图和有效掩码的形状
-        # # loss_smoothl1 = F.smooth_l1_loss(offset_map, gt_offset_map, reduction='none')
-        # # loss_smoothl1_try1 = loss_smoothl1
-        # loss_smoothl1 = (F.smooth_l1_loss(offset_map, gt_offset_map, reduction='none') * valid_masks).sum() / (valid_masks.sum() * 2 + 1e-6)
-        # # loss_smoothl1_try2 = F.smooth_l1_loss(offset_map * valid_masks, gt_offset_map * valid_masks, reduction='none') / (valid_masks.sum() + 1e-6)
-        # # loss_smoothl1 = loss_smoothl1_try2
-        # print(f'loss_smoothl1 mean: try1:{loss_smoothl1_try1.mean()}, try2:{loss_smoothl1_try2.mean()}')  # 输出平滑L1损失的形状和范围
+        # gt_masks = torch.cat([(target["masks"].unsqueeze(0)) > 0 for target in targets], dim=0).unsqueeze(1)  # [B, H, W]
+        # valid_masks = gt_masks
+        valid_masks = target_masks.unsqueeze(1) > 0  # [B, 1, H, W]
+        np.save("predict_offset_map.npy", offset_map.detach().cpu().numpy())
+
         # 计算 Smooth L1 损失，只在有效区域计算
+        # print(f'offset_map shape:{offset_map.shape}, gt_offset_map shape:{gt_offset_map.shape}')
         loss_smoothl1_raw = F.smooth_l1_loss(offset_map, gt_offset_map, reduction='none')  # [B, 2, H, W]
+        # loss_smoothl1_raw = F.mse_loss(offset_map, gt_offset_map, reduction='none')  # [B, 2, H, W]
         # 应用有效掩码，valid_masks: [B, 1, H, W] -> [B, 2, H, W]
         valid_masks_expanded = valid_masks.expand_as(loss_smoothl1_raw)
         masked_loss = loss_smoothl1_raw * valid_masks_expanded
-        
         # 正确的归一化：除以有效像素数量
         num_valid_pixels = valid_masks.sum()
         loss_smoothl1 = masked_loss.sum() / (num_valid_pixels + 1e-6)
         losses += loss_smoothl1 * 1.0  # Smooth L1 loss for offset regression
         loss_dict['loss_smoothl1'] = loss_smoothl1
         weight_dict['loss_smoothl1'] = 1.0
-
 
         # final loss
         # losses += loss_split * weight_split
@@ -589,19 +600,95 @@ class PET(nn.Module):
         sp_h, sp_w = src_h, src_w #稀疏层尺寸
         ds_h, ds_w = int(src_h * 2), int(src_w * 2) #密集层尺寸（2倍分辨率）
         split_map = self.quadtree_splitter(encode_src) #encode_src:[8, 256, 32, 32]
-        prob_map = self.foreground_head(encode_src)  # [B, 1, H, W]，前景概率图
-        prob_map_256 = F.interpolate(prob_map, size=samples.mask.shape[-2:], mode='bilinear', align_corners=False)  #将前景概率图上采样到原始图像尺寸
+        split_map_new = F.interpolate(split_map, (sp_h, sp_w)).reshape(bs, -1)
+        # print(f'split_map shape:{split_map_new.shape}')
+        # prob_map = self.foreground_head(encode_src)  # [B, 1, H, W]，前景概率图
+        # out = self.joint_head(encode_src)  # [B, 3, H, W]
+        # prob_map = out[:, 2:3, :, :]  # 前景概率图
+        prob_map_kwargs = kwargs.copy()
+        prob_map_kwargs['div'] = split_map_new.reshape(bs, sp_h, sp_w)
+        # if (split_map_sparse > 0.5).sum() > 0:
+        prob_map_kwargs['dec_win_size'] = [16, 8]  # 或你实际需要的窗口大小
+        # print(f'samples.tensors shape:{samples.tensors.shape}') #输出样本张量形状
+        pred_out = self.pet_head(samples, features, context_info, **prob_map_kwargs)
+        # print(f'pred_out keys:{pred_out.keys()}')
+        pred_points = pred_out['pred_points']
+        # pred_points_cpu = pred_points.detach().cpu()
+        # print(f"pred_points shape: {pred_points_cpu.shape}, "
+        #     f"min: {pred_points_cpu.min().item()}, "
+        #     f"max: {pred_points_cpu.max().item()}")
 
-        # prob_map_32 = F.interpolate(split_map, size=(32, 32), mode='bilinear', align_corners=False)
-        # prob_map_256 = F.interpolate(prob_map_32, size=samples.mask.shape[-2:], mode='bilinear', align_corners=False)
-        # print(f'pet_forward: prob_map shape: {prob_map_256.shape}, prob_map min: {prob_map_256.min()}, max: {prob_map_256.max()}') #输出概率图形状和范围
+        # prob_map = pred_out['prob_map']
+        # print(f'prob_map shape:{prob_map.shape}')
+        if pred_points.dim() == 2:
+            pred_points = pred_points.unsqueeze(0)
+            # print(f'pred_points unsqueeze to shape:{pred_points.shape}')
+        B, N, _ = pred_points.shape
+        H, W = samples.tensors.shape[2:]
+        device = pred_points.device
+
+        # prob_map = torch.zeros((B, 1, H, W), device=device)
+        # offset_map = torch.zeros((B, 2, H, W), device=device)
+
+        # Step1: prob_map with Gaussian
+        yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device))
+        prob_map = []
+        sigma = 4.0
+        for b in range(B):
+            # pred_points[b]: [N, 2]
+            x = pred_points[b, :, 0].view(-1, 1, 1)  # [N,1,1]
+            y = pred_points[b, :, 1].view(-1, 1, 1)  # [N,1,1]
+
+            g = torch.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2))  # [N,H,W]
+            g = g.max(dim=0)[0]  # 合并 N 个点
+            prob_map.append(g.unsqueeze(0))  # [1,H,W]
+
+        prob_map = torch.stack(prob_map, dim=0).unsqueeze(1)  # [B,1,H,W]
+
+        # Step2: offset_map using distance transform (CPU for now)
+        # 展开成 [1,1,H,W]，方便广播
+        xx = xx[None, None]   # [1,1,H,W]
+        yy = yy[None, None]   # [1,1,H,W]
+
+        B, N, _ = pred_points.shape
+        # print(f'pred_points.shape:{pred_points.shape}')
+        offset_maps = []
+
+        for b in range(B):
+            px = pred_points[b, :, 0].view(N, 1, 1)  # [N,1,1]
+            py = pred_points[b, :, 1].view(N, 1, 1)  # [N,1,1]
+            # print(f'px shape:{px.shape}, py shape:{py.shape}')
+
+            # 每个像素到所有点的偏移
+            dx = px - xx   # [N,H,W]
+            dy = py - yy   # [N,H,W]
+            dist2 = dx**2 + dy**2   # [N,H,W]
+            dx = dx.squeeze(0)
+            dy = dy.squeeze(0)
+            dist2 = dist2.squeeze(0)
+            # print(f'dx shape:{dx.shape}, dy shape:{dy.shape}, dist2 shape:{dist2.shape}')
+
+            # soft 最近点权重 (softmin)
+            w = torch.softmax(-dist2 / (2 * sigma**2), dim=0)  # [N,H,W]
+
+            # 加权求和 -> 最近点偏移
+            dx_final = (w * dx).sum(dim=0)   # [H,W]
+            dy_final = (w * dy).sum(dim=0)   # [H,W]
+            # print(f'dx_final shape:{dx_final.shape}, dy_final shape:{dy_final.shape}')
+
+            offset_maps.append(torch.stack([dx_final, dy_final], dim=0))  # [2,H,W]
+
+        offset_map = torch.stack(offset_maps, dim=0)  # [B,2,H,W]
+        # print(f'offset_map shape:{offset_map.shape}, prob_map shape:{prob_map.shape}')
+        # print(prob_map.shape, prob_map.dtype, prob_map.min(), prob_map.max())
+        # prob_map_256 = F.interpolate(prob_map, size=samples.mask.shape[-2:], mode='bilinear', align_corners=False)  #将前景概率图上采样到原始图像尺寸
 
         # print(f'pet_forward: encode_src shape:{encode_src.shape} split_map shape: {split_map.shape}, split_map min: {split_map.min()}, max: {split_map.max()}') #分割图形状和范围      
         split_map_dense = F.interpolate(split_map, (ds_h, ds_w)).reshape(bs, -1) #生成密集分割图 [8,64,64]
         split_map_sparse = 1 - F.interpolate(split_map, (sp_h, sp_w)).reshape(bs, -1) #生成稀疏分割图 [8,32,32]
         # print(f'pet_forward: split_map_sparse shape: {split_map_sparse.shape}, split_map_dense shape: {split_map_dense.shape}') #输出分割图形状
         # print(f'pet_forward: split_map_sparse min: {split_map_sparse.min()}, max: {split_map_sparse.max()}') #输出分割图范围         
-        prob_map = None
+        # prob_map = None
         count = 0
         # quadtree layer0 forward (sparse)
         if 'train' in kwargs or (split_map_sparse > 0.5).sum() > 0:
@@ -613,9 +700,9 @@ class PET(nn.Module):
         else:
             outputs_sparse = None
         
-        prob_sparse = F.interpolate(split_map_sparse.unsqueeze(1).view(bs, 1, sp_h, sp_w), size=samples.mask.shape[-2:], mode='bilinear', align_corners=False)
-        count += 1
-        prob_map = prob_sparse if prob_map is None else prob_map + prob_sparse
+        # prob_sparse = F.interpolate(split_map_sparse.unsqueeze(1).view(bs, 1, sp_h, sp_w), size=samples.mask.shape[-2:], mode='bilinear', align_corners=False)
+        # count += 1
+        # prob_map = prob_sparse if prob_map is None else prob_map + prob_sparse
 
         # quadtree layer1 forward (dense)
         if 'train' in kwargs or (split_map_dense > 0.5).sum() > 0:
@@ -629,14 +716,28 @@ class PET(nn.Module):
         else:
             outputs_dense = None
         
-        prob_dense = F.interpolate(split_map_dense.unsqueeze(1).view(bs, 1, ds_h, ds_w), size=samples.mask.shape[-2:], mode='bilinear', align_corners=False)
-        count += 1
-        prob_map = prob_dense if prob_map is None else prob_map + prob_dense
+        # prob_dense = F.interpolate(split_map_dense.unsqueeze(1).view(bs, 1, ds_h, ds_w), size=samples.mask.shape[-2:], mode='bilinear', align_corners=False)
+        # count += 1
+        # prob_map = prob_dense if prob_map is None else prob_map + prob_dense
         
         # prob_map_256 = prob_sparse + prob_dense if outputs_sparse is not None and outputs_dense is not None else prob_sparse if outputs_sparse is not None else prob_dense
         # if count > 0:
         #     prob_map_256 = prob_map / count
         # print(f'pet_forward: prob_map_256 shape: {prob_map_256.shape}, prob_map_256 min: {prob_map_256.min()}, max: {prob_map_256.max()}') #输出概率图形状和范围
+
+        # offset map 预测分支
+        # pred_offset_map = self.offset_head(encode_src)  # [B, 2, H, W]
+        # pred_offset_map = out[:, 0:2, :, :]  # [B, 2, H, W]
+
+        # offset_map_kwargs = kwargs.copy()
+        # offset_map_kwargs['dec_win_size'] = [16, 8]  # 或你实际需要的窗口大小
+        # # offset_map_out = self.offset_map_head(samples, features, context_info, **offset_map_kwargs)
+        # offset_map = pred_out['offset_map']
+        # print(f'offset_map shape:{offset_map.shape}, prob_map shape:{prob_map.shape}')
+        # print(f'prob_map requires_grad:{prob_map.requires_grad}, offset_map requires_grad:{offset_map.requires_grad}')
+        # pred_offset_map_256 = F.interpolate(offset_map, size=samples.mask.shape[-2:], 
+        #                                     mode='bilinear', align_corners=False)  # 上采样到原图大小
+
 
         # format outputs
         # print(f'split_map_sparse shape: {split_map_sparse.shape}, split_map_dense shape: {split_map_dense.shape}') #输出分割图形状
@@ -646,7 +747,8 @@ class PET(nn.Module):
         outputs['split_map_raw'] = split_map
         outputs['split_map_sparse'] = split_map_sparse
         outputs['split_map_dense'] = split_map_dense
-        outputs['prob_map'] = prob_map_256  #用于可视化的概率图
+        outputs['prob_map'] = prob_map.squeeze(1)  #用于可视化的概率图
+        outputs['offset_map'] = offset_map
         return outputs
     
     def train_forward(self, samples, features, pos, **kwargs):
@@ -655,6 +757,7 @@ class PET(nn.Module):
 
         # compute loss
         criterion, targets, epoch = kwargs['criterion'], kwargs['targets'], kwargs['epoch']
+
         # print(f'criterion:{criterion}') #SetCriterion((matcher): HungarianMatcher())
         # print(f'train_forward: outputs keys: {outputs.keys()}') #输出结果的键
         # print(f'targets keys: {[target.keys() for target in targets]}')  # 输出目标的键
@@ -662,6 +765,7 @@ class PET(nn.Module):
         return losses
     
     def test_forward(self, samples, features, pos, **kwargs):
+        # targets = kwargs['targets']
         outputs = self.pet_forward(samples, features, pos, **kwargs)
         # print(f'test_forward: output keys: {outputs.keys()}') #输出结果的键
         out_dense, out_sparse = outputs['dense'], outputs['sparse']
@@ -700,6 +804,7 @@ class PET(nn.Module):
                 div_out[name] = out_sparse[name] if out_sparse is not None else out_dense[name]
         div_out['split_map_raw'] = outputs['split_map_raw']
         div_out['prob_map'] = outputs['prob_map']
+        div_out['offset_map'] = outputs['offset_map']
         return div_out
 
 

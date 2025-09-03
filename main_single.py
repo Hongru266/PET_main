@@ -26,7 +26,7 @@ def get_args_parser():
     # training Parameters
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=8, type=int)  # 减少 batch size
+    parser.add_argument('--batch_size', default=4, type=int)  # 减少 batch size
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=1500, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
@@ -65,6 +65,8 @@ def get_args_parser():
                         help="Binary Cross Entropy loss coefficient")
     parser.add_argument('--smoothl1_loss_coef', default=1.0, type=float,
                         help="Dice loss coefficient")
+    parser.add_argument('--mse_loss_coef', default=0.001, type=float,
+                        help="Mean Squared Error loss coefficient")
     parser.add_argument('--eos_coef', default=0.5, type=float,
                         help="Relative classification weight of the no-object class")
 
@@ -227,7 +229,7 @@ def main(args):
 
     # 检查自动checkpoint目录
     ckpt_dir_name = f"{args.output_dir}_{args.lr}_{args.batch_size}_"
-    ckpt_dir_name += f"{args.bce_loss_coef}_{args.smoothl1_loss_coef}_0828_try1"
+    ckpt_dir_name += f"{args.bce_loss_coef}_{args.smoothl1_loss_coef}_0902_try4_newNet"
     args.ckpt_dir = os.path.join("checkpoints", args.dataset_file, ckpt_dir_name)
     # 如果没有命令行指定的resume路径，则尝试从自动保存目录恢复
     if not args.resume and os.path.exists(args.ckpt_dir):

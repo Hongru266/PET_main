@@ -246,6 +246,16 @@ class SHA(Dataset):
                 next_index = (index + 1) % len(self.img_list)
             return self.__getitem__(next_index)
 
+        #测试gt prob_map和shift_map
+        target_masks = target["masks"].float()
+        # 将非0值均变为1
+        binary_target_masks = (target_masks > 0).float()
+        # print(f'binary_target_masks: {binary_target_masks}')
+        offset_map = target['offset_map']
+        # print(f'offset_map: {offset_map}')
+        np.save("0901_binary_target_masks.npy", binary_target_masks.cpu().numpy())
+        np.save("0901_offset_map.npy", offset_map.cpu().numpy())
+
         return img, target
 
 
